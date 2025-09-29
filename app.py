@@ -34,7 +34,11 @@ def _open_text_from_upload(uploaded) -> io.StringIO:
     return io.StringIO(text)
 
 def _read_hlma_block(text: str) -> pd.DataFrame | None:
-    # HLMA export: header, *** data ***, rows; skip '...'
+    """
+    HLMA export format:
+      header block, '*** data ***' sentinel, then numeric rows (often 8 cols):
+      time_uts lat lon alt_m chi2 nstations p_dbw mask
+    """
     lines = text.splitlines()
     start = None
     for i, ln in enumerate(lines):
@@ -43,6 +47,7 @@ def _read_hlma_block(text: str) -> pd.DataFrame | None:
             break
     if start is None:
         return None
+
     num_line = re.compile(r'^\s*[+-]?\d')
     data_lines = []
     for ln in lines[start:]:
@@ -52,27 +57,36 @@ def _read_hlma_block(text: str) -> pd.DataFrame | None:
         if not num_line.match(s):
             continue
         data_lines.append(ln)
+
     if not data_lines:
         return pd.DataFrame()
+
     try:
         df = pd.read_csv(io.StringIO("\n".join(data_lines)), sep=r"\s+", engine="python",
                          header=None, on_bad_lines="skip", skip_blank_lines=True)
     except TypeError:
         df = pd.read_csv(io.StringIO("\n".join(data_lines)), sep=r"\s+", engine="python",
                          header=None, error_bad_lines=False, warn_bad_lines=False, skip_blank_lines=True)
+
     if df.shape[1] == 8:
         df.columns = ["time_uts", "lat", "lon", "alt_m", "chi2", "nstations", "p_dbw", "mask"]
     else:
         df.columns = [f"col_{i}" for i in range(df.shape[1])]
         if df.shape[1] >= 4:
-            df = df.rename(columns={df.columns[0]: "time_uts", df.columns[1]: "lat",
-                                    df.columns[2]: "lon", df.columns[3]: "alt_m"})
+            df = df.rename(columns={
+                df.columns[0]: "time_uts",
+                df.columns[1]: "lat",
+                df.columns[2]: "lon",
+                df.columns[3]: "alt_m",
+            })
     return df
 
 def _generic_parse(text: str) -> pd.DataFrame:
     data_lines = [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
     if not data_lines:
         return pd.DataFrame()
+
+    # 1) Sniffer
     try:
         df = pd.read_csv(io.StringIO("\n".join(data_lines)), sep=None, engine="python",
                          header=None, on_bad_lines="skip", skip_blank_lines=True)
@@ -84,6 +98,8 @@ def _generic_parse(text: str) -> pd.DataFrame:
             df = None
     except Exception:
         df = None
+
+    # 2) Regex sep
     if df is None or df.empty:
         try:
             df = pd.read_csv(io.StringIO("\n".join(data_lines)), sep=r"\s+|,", engine="python",
@@ -96,6 +112,8 @@ def _generic_parse(text: str) -> pd.DataFrame:
                 df = None
         except Exception:
             df = None
+
+    # 3) Manual normalize
     if df is None or df.empty:
         splitter = re.compile(r"[, \t]+")
         rows, widths = [], []
@@ -115,6 +133,7 @@ def _generic_parse(text: str) -> pd.DataFrame:
                 parts = parts[:most_w]
             fixed.append(parts)
         df = pd.DataFrame(fixed)
+
     if df.columns.dtype == "int64" or any(isinstance(c, (int, np.integer)) for c in df.columns):
         df.columns = [f"col_{i}" for i in range(df.shape[1])]
     return df
@@ -127,20 +146,16 @@ def _read_dat_to_df(uploaded) -> pd.DataFrame:
         df = _generic_parse(text)
     if df.empty:
         return df
-    # normalize any unnamed
-    new_cols = []
-    for i, c in enumerate(df.columns):
-        cn = str(c)
-        if cn.lower().startswith("unnamed") or cn.strip() == "":
-            cn = f"col_{i}"
-        new_cols.append(cn)
-    df.columns = new_cols
+    # Normalize any unnamed columns
+    df.columns = [f"col_{i}" if (str(c).strip() == "" or str(c).lower().startswith("unnamed"))
+                  else str(c) for i, c in enumerate(df.columns)]
     return df
 
 def _coerce_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 def _lon_wrap(lon: pd.Series) -> pd.Series:
+    """Wrap longitudes to [-180, 180] if they look like [0, 360]."""
     s = lon.copy()
     if s.max(skipna=True) > 180 and s.min(skipna=True) >= 0:
         s = ((s + 180) % 360) - 180
@@ -157,7 +172,6 @@ with st.sidebar:
     up_csv = st.file_uploader("CSV with storm paths (BEGIN_/END_ columns)", type=["csv"], accept_multiple_files=False)
     st.caption("Expected columns: BEGIN_LAT/LON, END_LAT/LON (+ metadata).")
 
-# If no lightning file, stop early
 if up_dat is None:
     st.info("Upload an HLMA .dat/.dat.gz file to start. You can add a storm CSV afterward.")
     st.stop()
@@ -248,13 +262,11 @@ storm_rows = []
 if up_csv is not None:
     try:
         sdf = pd.read_csv(up_csv)
-        # Soft check for required columns
         req = {"BEGIN_LAT","BEGIN_LON","END_LAT","END_LON"}
         if not req.issubset(set(sdf.columns)):
             st.warning("Storm CSV missing required columns: BEGIN_LAT, BEGIN_LON, END_LAT, END_LON.")
         else:
-            # Build minimal JSON rows for JS
-            def safe_str(x): 
+            def safe_str(x):
                 try:
                     return "" if (pd.isna(x)) else str(x)
                 except Exception:
@@ -294,7 +306,6 @@ st.success(f"Lightning parsed: {len(work_df):,} rows • Plotted: {len(plot_df):
 if plot_df.empty and not storm_rows:
     st.warning("Nothing to plot yet. Adjust filters or upload a storm CSV.")
 else:
-    # Data to JS
     lightning_json = json.dumps(plot_df.to_dict(orient="records"))   # [{lat,lon,alt,(time?)}]
     time_field = time_col if time_col != "(none)" else ""
     storm_json = json.dumps(storm_rows)                               # [{b_lat,b_lon,e_lat,e_lon,meta:{...}}]
@@ -311,12 +322,7 @@ else:
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
-  <!-- MarkerCluster -->
-  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
-  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
-
-  <!-- Heatmap (optional) -->
+  <!-- (Optional) Heatmap if needed later -->
   <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
 
   <style>
@@ -375,15 +381,14 @@ else:
       return '#c70039';
     }
 
-    // Map init
+    // Initial view: try lightning, else storms, else fallback
     var lats = [], lons = [];
     for (var i=0;i<points.length;i++){
       var p = points[i];
-      var lat = Number(p.lat), lon = Number(p.lon);
-      if (!isNaN(lat)) lats.push(lat);
-      if (!isNaN(lon)) lons.push(lon);
+      var la = Number(p.lat), lo = Number(p.lon);
+      if (!isNaN(la)) lats.push(la);
+      if (!isNaN(lo)) lons.push(lo);
     }
-    // If no lightning, use storms to compute initial view
     if (lats.length === 0 && storms.length > 0) {
       for (var i=0;i<storms.length;i++){
         lats.push(Number(storms[i].b_lat), Number(storms[i].e_lat));
@@ -396,56 +401,32 @@ else:
       { attribution: '© OpenStreetMap contributors' }
     ).addTo(map);
 
-    // Lightning points layer(s)
-    var cluster = L.markerClusterGroup({ disableClusteringAtZoom: 11 });
-    var plain = L.layerGroup();
-    var usingCluster = true;
+    // --- Lightning points (plain LayerGroup of circleMarkers) ---
+    var lightningGroup = L.layerGroup().addTo(map);
 
-    function addLightning(){
-      cluster.clearLayers(); plain.clearLayers();
-      var minLat=+90, maxLat=-90, minLon=+180, maxLon=-180;
+    function renderLightning(){
+      lightningGroup.clearLayers();
       for (var i=0;i<points.length;i++){
         var p = points[i];
         var lat = Number(p.lat), lon = Number(p.lon), alt = Number(p.alt);
         if (isNaN(lat) || isNaN(lon)) continue;
+
         var c = colorForAlt(alt);
         var popup = "<b>Alt:</b> " + (isFinite(alt)? alt : "n/a") + " m<br>"
                   + "<b>Lat/Lon:</b> " + lat.toFixed(4) + ", " + lon.toFixed(4);
         if (timeField && (timeField in p)) popup += "<br><b>Time:</b> " + String(p[timeField]);
+
         var m = L.circleMarker([lat, lon], {
           radius: 5, color: c, fillColor: c, fillOpacity: 0.9, opacity: 1, weight: 1
         }).bindPopup(popup);
-        cluster.addLayer(m); plain.addLayer(m);
-        if (lat < minLat) minLat = lat; if (lat > maxLat) maxLat = lat;
-        if (lon < minLon) minLon = lon; if (lon > maxLon) maxLon = lon;
+
+        lightningGroup.addLayer(m);
       }
-      return [minLat, maxLat, minLon, maxLon];
     }
+    renderLightning();
 
-    var lightningBounds = addLightning();
-    cluster.addTo(map);
-
-    // Storm paths layer
+    // --- Storm paths layer ---
     var stormsGroup = L.layerGroup();
-    function addStorms(){
-      stormsGroup.clearLayers();
-      for (var i=0;i<storms.length;i++){
-        var s = storms[i];
-        var bl = [Number(s.b_lat), Number(s.b_lon)], el = [Number(s.e_lat), Number(s.e_lon)];
-        if (!isFinite(bl[0]) || !isFinite(bl[1]) || !isFinite(el[0]) || !isFinite(el[1])) continue;
-
-        // Line
-        var line = L.polyline([bl, el], { color:'#2e7d32', weight:4, opacity:0.9 }).addTo(stormsGroup);
-
-        // Start / End markers
-        var startM = L.circleMarker(bl, { radius: 6, color:'#2e7d32', fillColor:'#2e7d32', fillOpacity:0.9 })
-                        .bindPopup(buildStormPopup(s.meta, true));
-        var endM   = L.circleMarker(el, { radius: 6, color:'#b71c1c', fillColor:'#b71c1c', fillOpacity:0.9 })
-                        .bindPopup(buildStormPopup(s.meta, false));
-        stormsGroup.addLayer(startM); stormsGroup.addLayer(endM);
-      }
-    }
-
     function safe(x){ return (x===null || x===undefined) ? "" : String(x); }
     function buildStormPopup(meta, isStart){
       var label = isStart ? "<b>Start</b>" : "<b>End</b>";
@@ -465,19 +446,33 @@ else:
         + ((ed||et)? ("End: " + ed + " " + et + "<br>") : "")
         + (narr? ("<hr style='margin:6px 0'><div style='max-width:260px; white-space:normal'>" + narr + "</div>") : "");
     }
+    function renderStorms(){
+      stormsGroup.clearLayers();
+      for (var i=0;i<storms.length;i++){
+        var s = storms[i];
+        var bl = [Number(s.b_lat), Number(s.b_lon)], el = [Number(s.e_lat), Number(s.e_lon)];
+        if (!isFinite(bl[0]) || !isFinite(bl[1]) || !isFinite(el[0]) || !isFinite(el[1])) continue;
 
+        var line = L.polyline([bl, el], { color:'#2e7d32', weight:4, opacity:0.9 }).addTo(stormsGroup);
+        var startM = L.circleMarker(bl, { radius: 6, color:'#2e7d32', fillColor:'#2e7d32', fillOpacity:0.9 })
+                        .bindPopup(buildStormPopup(s.meta, true));
+        var endM   = L.circleMarker(el, { radius: 6, color:'#b71c1c', fillColor:'#b71c1c', fillOpacity:0.9 })
+                        .bindPopup(buildStormPopup(s.meta, false));
+        stormsGroup.addLayer(startM); stormsGroup.addLayer(endM);
+      }
+    }
     if (storms.length > 0) {
-      addStorms();
+      renderStorms();
       stormsGroup.addTo(map);
     }
 
-    // Fit bounds if we have anything
+    // Fit bounds to all data
     function fitData(){
       var minLat=+90, maxLat=-90, minLon=+180, maxLon=-180, have=false;
       // lightning
       for (var i=0;i<points.length;i++){
         var p = points[i]; var lat = Number(p.lat), lon = Number(p.lon);
-        if (!isNaN(lat) && !isNaN(lon)){ have=true; if (lat<minLat)minLat=lat; if(lat>maxLat)maxLat=lat; if(lon<minLon)minLon=lon; if(lon>maxLon)maxLon=lon;}
+        if (!isNaN(lat) && !isNaN(lon)){ have=true; if (lat<minLat)minLat=lat; if(lat>maxLat)maxLat=lat; if(lon<minLon)minLon=lon; if(lon>maxLon)maxLon=lon; }
       }
       // storms
       for (var i=0;i<storms.length;i++){
@@ -498,22 +493,17 @@ else:
     var cbS = document.getElementById('toggleStorms');
 
     function syncLightning(){
-      if (cbL.checked){
-        if (usingCluster){ cluster.addTo(map); plain.remove(); }
-        else { plain.addTo(map); cluster.remove(); }
-      } else {
-        cluster.remove(); plain.remove();
-      }
+      if (cbL.checked){ lightningGroup.addTo(map); }
+      else { map.removeLayer(lightningGroup); }
     }
-    cbL.addEventListener('change', syncLightning);
-
     function syncStorms(){
       if (cbS.checked){ stormsGroup.addTo(map); }
-      else { stormsGroup.remove(); }
+      else { map.removeLayer(stormsGroup); }
     }
+    cbL.addEventListener('change', syncLightning);
     cbS.addEventListener('change', syncStorms);
 
-    // Initialize toggle state
+    // Init
     syncLightning();
     syncStorms();
   </script>
