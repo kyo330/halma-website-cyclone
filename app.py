@@ -48,9 +48,9 @@ def _read_hlma_block(text: str) -> pd.DataFrame | None:
             start = i + 1
             break
     if start is None:
-        return None  # not a recognized HLMA export layout
+        return None  
 
-    num_line = re.compile(r'^\s*[+-]?\d')  # line starts with a number
+    num_line = re.compile(r'^\s*[+-]?\d')  
     data_lines = []
     for ln in lines[start:]:
         s = ln.strip()
@@ -63,7 +63,7 @@ def _read_hlma_block(text: str) -> pd.DataFrame | None:
     if not data_lines:
         return pd.DataFrame()
 
-    # Use whitespace delimiter; tolerate ragged rows
+    
     try:
         df = pd.read_csv(
             io.StringIO("\n".join(data_lines)),
@@ -74,7 +74,7 @@ def _read_hlma_block(text: str) -> pd.DataFrame | None:
             skip_blank_lines=True,
         )
     except TypeError:
-        # pandas < 1.3 fallback
+        
         df = pd.read_csv(
             io.StringIO("\n".join(data_lines)),
             sep=r"\s+",
@@ -85,7 +85,7 @@ def _read_hlma_block(text: str) -> pd.DataFrame | None:
             skip_blank_lines=True,
         )
 
-    # Name columns when 8 present; otherwise map best-effort first 4
+   
     if df.shape[1] == 8:
         df.columns = ["time_uts", "lat", "lon", "alt_m", "chi2", "nstations", "p_dbw", "mask"]
     else:
@@ -105,7 +105,7 @@ def _generic_parse(text: str) -> pd.DataFrame:
     if not data_lines:
         return pd.DataFrame()
 
-    # 1) csv.Sniffer (sep=None)
+    
     try:
         df = pd.read_csv(
             io.StringIO("\n".join(data_lines)),
@@ -116,7 +116,7 @@ def _generic_parse(text: str) -> pd.DataFrame:
             skip_blank_lines=True,
         )
     except TypeError:
-        # older pandas
+        
         try:
             df = pd.read_csv(
                 io.StringIO("\n".join(data_lines)),
@@ -132,7 +132,7 @@ def _generic_parse(text: str) -> pd.DataFrame:
     except Exception:
         df = None
 
-    # 2) regex delimiter (whitespace OR comma)
+    
     if df is None or df.empty:
         try:
             df = pd.read_csv(
@@ -159,7 +159,7 @@ def _generic_parse(text: str) -> pd.DataFrame:
         except Exception:
             df = None
 
-    # 3) last resort: manual split normalized to most-common width
+    
     if df is None or df.empty:
         splitter = re.compile(r"[, \t]+")
         rows, widths = [], []
@@ -180,7 +180,7 @@ def _generic_parse(text: str) -> pd.DataFrame:
             fixed.append(parts)
         df = pd.DataFrame(fixed)
 
-    # give generic names if pandas left them numeric
+    
     if df.columns.dtype == "int64" or any(isinstance(c, (int, np.integer)) for c in df.columns):
         df.columns = [f"col_{i}" for i in range(df.shape[1])]
     return df
@@ -201,7 +201,7 @@ def _read_dat_to_df(uploaded) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # Normalize any unnamed columns
+    
     df.columns = [
         f"col_{i}" if (str(c).strip() == "" or str(c).lower().startswith("unnamed")) else str(c)
         for i, c in enumerate(df.columns)
@@ -225,12 +225,12 @@ with st.sidebar:
     st.header("1) Upload HLMA .dat / .dat.gz")
     up_dat = st.file_uploader("Choose a .dat or .dat.gz file", type=["dat", "gz"], accept_multiple_files=False)
 
-    st.header("2) Upload storm CSV (optional)")
+    st.header("2) Upload storm report CSV (optional)")
     up_csv = st.file_uploader("CSV with storm paths (BEGIN_/END_ columns)", type=["csv"], accept_multiple_files=False)
     st.caption("Needs: BEGIN_LAT/LON, END_LAT/LON. Other fields (EF, length, width, etc.) are optional but shown if present.")
 
 if up_dat is None:
-    st.info("Upload an HLMA .dat/.dat.gz file to start. Then add a storm CSV to overlay.")
+    st.info("Upload an HLMA .dat/.dat.gz file to start. Then add a storm report CSV to overlay.")
     st.stop()
 
 # =========================
