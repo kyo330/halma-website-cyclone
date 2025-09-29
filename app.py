@@ -1,22 +1,30 @@
 import io
 import gzip
 from pathlib import Path
+import json
 import re
 from collections import Counter
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-import pydeck as pdk
+from streamlit.components.v1 import html as st_html
 
 # ---------------------------
-# Page & header
+# Page config
 # ---------------------------
-st.set_page_config(page_title="Lightning — Fixed Area", layout="wide")
-st.markdown("#### HLMA Website")
+st.set_page_config(
+    page_title="HLMA Lightning Mapper (.dat)",
+    layout="wide",
+)
+
+st.title("⚡ HLMA Lightning — .dat Uploader & Map")
+st.caption(
+    "Upload an HLMA .dat or .dat.gz file, map the strikes, and explore with filters."
+)
 
 # ---------------------------
-# HLMA helpers
+# Helpers
 # ---------------------------
 
 def _is_gz(bytes_buf: bytes) -> bool:
@@ -31,117 +39,61 @@ def _open_text_from_upload(uploaded) -> io.StringIO:
         text = raw.decode("utf-8", errors="replace")
     return io.StringIO(text)
 
-def _read_hlma_block(s: str) -> pd.DataFrame | None:
-    """
-    HLMA-export aware parser:
-      - find '*** data ***'
-      - keep only rows AFTER it that start with a number
-      - drop literal '...' lines
-      - parse as whitespace-delimited (8 columns typical)
-      - assign HLMA column names: time_uts, lat, lon, alt_m, chi2, nstations, p_dbw, mask
-    """
-    lines_all = s.splitlines()
-    start_idx = None
-    for i, ln in enumerate(lines_all):
-        if '*** data ***' in ln.lower():
-            start_idx = i + 1
-            break
-    if start_idx is None:
-        return None
+def _detect_header_and_sep(sample_text: str):
+    first_data_line = None
+    for ln in sample_text.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        first_data_line = s
+        break
 
-    num_pat = re.compile(r'^\s*[+-]?\d')
-    data_lines = []
-    for ln in lines_all[start_idx:]:
-        if not ln.strip():
-            continue
-        if ln.strip() == '...':
-            continue
-        if not num_pat.match(ln):
-            continue
-        data_lines.append(ln)
-    if not data_lines:
-        return pd.DataFrame()
+    has_header, sep, delim_ws = False, None, False
+    if first_data_line is None:
+        return has_header, sep, True
 
-    df = pd.read_csv(
-        io.StringIO("\n".join(data_lines)),
-        sep=r"\s+",
-        engine="python",
-        header=None,
-        on_bad_lines="skip",
-        skip_blank_lines=True,
-    )
-    names_8 = ["time_uts", "lat", "lon", "alt_m", "chi2", "nstations", "p_dbw", "mask"]
-    if df.shape[1] == 8:
-        df.columns = names_8
+    if "," in first_data_line:
+        sep = ","
+        tokens = [t.strip() for t in first_data_line.split(",")]
     else:
-        df.columns = [f"col_{i}" for i in range(df.shape[1])]
-        if df.shape[1] >= 4:
-            df = df.rename(columns={
-                df.columns[0]: "time_uts",
-                df.columns[1]: "lat",
-                df.columns[2]: "lon",
-                df.columns[3]: "alt_m",
-            })
-    return df
+        delim_ws = True
+        tokens = first_data_line.split()
 
-def _generic_parse(s: str) -> pd.DataFrame:
-    data_lines = [ln for ln in s.splitlines() if ln.strip() and not ln.lstrip().startswith('#')]
-    if not data_lines:
-        return pd.DataFrame()
-
-    df = None
-    try:
-        df = pd.read_csv(io.StringIO("\n".join(data_lines)),
-                         sep=None, engine="python", header=None,
-                         on_bad_lines="skip", skip_blank_lines=True)
-    except Exception:
-        df = None
-    if df is None or df.empty:
+    def _is_num(tok: str) -> bool:
         try:
-            df = pd.read_csv(io.StringIO("\n".join(data_lines)),
-                             sep=r"\s+|,", engine="python", header=None,
-                             on_bad_lines="skip", skip_blank_lines=True)
+            float(tok); return True
         except Exception:
-            df = None
-    if df is None or df.empty:
-        splitter = re.compile(r"[, \t]+")
-        rows, widths = [], []
-        for ln in data_lines:
-            parts = [p for p in splitter.split(ln.strip()) if p != ""]
-            if parts:
-                rows.append(parts)
-                widths.append(len(parts))
-        if not rows:
-            return pd.DataFrame()
-        most_w = Counter(widths).most_common(1)[0][0]
-        fixed = []
-        for parts in rows:
-            if len(parts) < most_w:
-                parts = parts + [""] * (most_w - len(parts))
-            elif len(parts) > most_w:
-                parts = parts[:most_w]
-            fixed.append(parts)
-        df = pd.DataFrame(fixed)
-    if df.columns.dtype == "int64" or any(isinstance(c, (int, np.integer)) for c in df.columns):
-        df.columns = [f"col_{i}" for i in range(len(df.columns))]
-    return df
+            return False
+    non_num = sum(0 if _is_num(t) else 1 for t in tokens)
+    has_header = non_num >= max(1, len(tokens) // 3)
+    return has_header, sep, delim_ws
 
 def _read_dat_to_df(uploaded) -> pd.DataFrame:
     sio = _open_text_from_upload(uploaded)
-    text = sio.getvalue()
-    df = _read_hlma_block(text)
-    if df is None:
-        df = _generic_parse(text)
-    if df.empty:
-        return df
-    # Clean column names
-    new_cols = []
-    for i, c in enumerate(df.columns):
-        cn = str(c)
-        if cn.lower().startswith("unnamed") or cn.strip() == "":
-            cn = f"col_{i}"
-        new_cols.append(cn)
-    df.columns = new_cols
+    sample = sio.getvalue()[:10_000]
+    has_header, sep, delim_ws = _detect_header_and_sep(sample)
+
+    sio.seek(0)
+    try:
+        if delim_ws:
+            df = pd.read_csv(
+                sio, comment="#", header=0 if has_header else None,
+                delim_whitespace=True, engine="python",
+            )
+        else:
+            df = pd.read_csv(
+                sio, comment="#", header=0 if has_header else None,
+                sep=sep, engine="python",
+            )
+    except Exception:
+        sio.seek(0)
+        df = pd.read_csv(
+            sio, comment="#", header=0 if has_header else None,
+            sep=r"\s+|,", engine="python",
+        )
+
+    if df.columns.dtype == "int64" or any(isinstance(c, (int, np.integer)) for c in df.columns):
+        df.columns = [f"col_{i}" for i in range(len(df.columns))]
     return df
 
 def _coerce_numeric(series: pd.Series) -> pd.Series:
@@ -153,43 +105,36 @@ def _lon_wrap(lon: pd.Series) -> pd.Series:
         s = ((s + 180) % 360) - 180
     return s
 
-def _initial_view(df: pd.DataFrame, lat_col: str, lon_col: str):
-    lat = df[lat_col].astype(float)
-    lon = df[lon_col].astype(float)
-    lat_m = float(np.nanmean(lat)) if len(lat) else 0.0
-    lon_m = float(np.nanmean(lon)) if len(lon) else 0.0
-    return pdk.ViewState(latitude=lat_m, longitude=lon_m, zoom=7, pitch=0)
-
 # ---------------------------
-# UI: upload + parse
+# Sidebar — Upload & Mapping
 # ---------------------------
 with st.sidebar:
-    st.header("Upload HLMA .dat/.dat.gz")
-    up = st.file_uploader("Choose a .dat or .dat.gz file", type=["dat", "gz"], accept_multiple_files=False)
+    st.header("1) Upload .dat / .dat.gz")
+    up = st.file_uploader(
+        "Choose a .dat or .dat.gz file",
+        type=["dat", "gz"],
+        accept_multiple_files=False,
+    )
+
+    st.header("2) Column Mapping")
+    st.caption("If your file has headers like 'lat'/'lon', I'll detect them. Otherwise, pick the columns below.")
 
 if up is None:
-    st.info("Upload an HLMA export. Header + '*** data ***' handled automatically. Lines like '...' are skipped.")
+    st.info(
+        "Upload an HLMA .dat (or .dat.gz) file in the sidebar to begin.\n\n"
+        "Tip: comment lines starting with '#' are ignored."
+    )
     st.stop()
 
+# Parse
 raw_df = _read_dat_to_df(up)
 
-# pick columns (defaults favor HLMA names)
-if set(["lat", "lon"]).issubset(raw_df.columns):
-    lat_default, lon_default = "lat", "lon"
-else:
-    lat_default = None
-    lon_default = None
-    for c in raw_df.columns:
-        s = pd.to_numeric(raw_df[c], errors="coerce")
-        if s.notna().mean() < 0.8:
-            continue
-        mn, mx = float(s.min()), float(s.max())
-        if lat_default is None and -90.5 <= mn <= 90.5 and -90.5 <= mx <= 90.5:
-            lat_default = c
-        if lon_default is None and -180.5 <= mn <= 360.5 and -180.5 <= mx <= 360.5:
-            lon_default = c
-    if lat_default is None and len(raw_df.columns) >= 2: lat_default = raw_df.columns[1]
-    if lon_default is None and len(raw_df.columns) >= 3: lon_default = raw_df.columns[2]
+# Auto-detect likely latitude/longitude column names
+lower_names = {c.lower(): c for c in raw_df.columns.astype(str)}
+cand_lat = [n for n in ["lat", "latitude", "lat_deg", "y", "phi", "col_1", "col_2"] if n in lower_names]
+cand_lon = [n for n in ["lon", "longitude", "long", "lon_deg", "x", "lambda", "col_0", "col_3"] if n in lower_names]
+lat_default = lower_names.get(cand_lat[0], None) if cand_lat else None
+lon_default = lower_names.get(cand_lon[0], None) if cand_lon else None
 
 with st.sidebar:
     col_options = list(raw_df.columns.astype(str))
@@ -197,16 +142,10 @@ with st.sidebar:
                            index=(col_options.index(lat_default) if lat_default in col_options else 0))
     lon_col = st.selectbox("Longitude column", options=col_options,
                            index=(col_options.index(lon_default) if lon_default in col_options else min(1, len(col_options)-1)))
-    alt_candidates = [c for c in raw_df.columns if c.lower() in {"alt", "alt_m", "altitude", "altitude_m"}]
-    alt_default = alt_candidates[0] if alt_candidates else None
-    alt_col = st.selectbox("Altitude column (optional)", options=["(none)"] + col_options,
-                           index=(0 if alt_default is None else (col_options.index(alt_default)+1)))
-    time_candidates = [c for c in raw_df.columns if c.lower() in {"time", "time_uts", "time_sec", "t"}]
-    time_default = time_candidates[0] if time_candidates else None
-    time_col = st.selectbox("Time column (optional)", options=["(none)"] + col_options,
-                            index=(0 if time_default is None else (col_options.index(time_default)+1)))
+    alt_col = st.selectbox("Altitude column (optional)", options=["(none)"] + col_options, index=0)
+    time_col = st.selectbox("Time column (optional)", options=["(none)"] + col_options, index=0)
 
-# clean
+# Clean and coerce
 work_df = raw_df.copy()
 work_df[lat_col] = _coerce_numeric(work_df[lat_col])
 work_df[lon_col] = _coerce_numeric(work_df[lon_col])
@@ -220,25 +159,27 @@ work_df[lon_col] = _lon_wrap(work_df[lon_col])
 work_df = work_df[np.isfinite(work_df[lat_col]) & np.isfinite(work_df[lon_col])].copy()
 
 if work_df.empty:
-    st.error("No valid latitude/longitude rows found after parsing. If this is an HLMA export, ensure '*** data ***' exists and rows follow it.")
+    st.error("No valid latitude/longitude rows found after parsing. Check the column mapping and try again.")
     st.stop()
 
 # ---------------------------
-# filters
+# Sidebar — Filters
 # ---------------------------
 with st.sidebar:
-    st.header("Filters")
-    lat_min, lat_max = float(np.nanmin(work_df[lat_col])), float(np.nanmax(work_df[lat_col]))
-    lon_min, lon_max = float(np.nanmin(work_df[lon_col])), float(np.nanmax(work_df[lon_col]))
+    st.header("3) Filters")
+    lat_min = float(np.nanmin(work_df[lat_col])); lat_max = float(np.nanmax(work_df[lat_col]))
+    lon_min = float(np.nanmin(work_df[lon_col])); lon_max = float(np.nanmax(work_df[lon_col]))
     lat_rng = st.slider("Latitude range", min_value=lat_min, max_value=lat_max, value=(lat_min, lat_max))
     lon_rng = st.slider("Longitude range", min_value=lon_min, max_value=lon_max, value=(lon_min, lon_max))
 
     alt_rng = None
-    if work_df[alt_col].notna().any():
-        a_min, a_max = float(np.nanmin(work_df[alt_col])), float(np.nanmax(work_df[alt_col]))
+    if alt_col:
+        a_min = float(np.nanmin(work_df[alt_col])) if work_df[alt_col].notna().any() else 0.0
+        a_max = float(np.nanmax(work_df[alt_col])) if work_df[alt_col].notna().any() else 0.0
         if a_min != a_max:
             alt_rng = st.slider("Altitude range (units as in file)", min_value=a_min, max_value=a_max, value=(a_min, a_max))
 
+# Apply filters
 flt = (work_df[lat_col].between(lat_rng[0], lat_rng[1])) & (work_df[lon_col].between(lon_rng[0], lon_rng[1]))
 if alt_rng is not None:
     flt &= work_df[alt_col].between(alt_rng[0], alt_rng[1])
@@ -249,43 +190,119 @@ plot_df.rename(columns={lat_col: "lat", lon_col: "lon", alt_col: "alt"}, inplace
 st.success(f"Parsed rows: {len(work_df):,} • Plotted rows: {len(plot_df):,}")
 
 # ---------------------------
-# map
+# Map (Leaflet via HTML)
 # ---------------------------
 if plot_df.empty:
     st.warning("No points within the selected filters.")
 else:
-    view = _initial_view(plot_df, "lat", "lon")
+    # prepare data for JS
+    rows = plot_df.to_dict(orient="records")
+    data_json = json.dumps(rows)  # [{lat, lon, alt, <time?>}, ...]
 
-    def build_tooltip(row):
-        parts = [f"lat: {row['lat']:.4f}", f"lon: {row['lon']:.4f}"]
-        if not (np.isnan(row.get("alt", np.nan))):
-            parts.append(f"alt: {row['alt']}")
-        if time_col != "(none)":
-            parts.append(f"time: {row.get(time_col)}")
-        return " | ".join(parts)
+    st_html(f"""
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Leaflet Map</title>
 
-    plot_df["tooltip"] = plot_df.apply(build_tooltip, axis=1)
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
-    layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=plot_df,
-        get_position="[lon, lat]",
-        get_radius=800,
-        auto_highlight=True,
-        pickable=True,
-        opacity=0.6,
-    )
+  <!-- MarkerCluster -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 
-    deck = pdk.Deck(
-        layers=[layer],
-        initial_view_state=view,
-        map_style="mapbox://styles/mapbox/light-v11",
-        tooltip={"text": "{tooltip}"},
-    )
-    st.pydeck_chart(deck, use_container_width=True)
+  <!-- Heatmap -->
+  <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+
+  <style>
+    html, body, #map {{ height: 700px; margin: 0; padding: 0; }}
+    .summary {{
+      position: absolute; top: 12px; left: 12px; z-index: 500;
+      background: rgba(255,255,255,0.96); padding:8px 10px; border-radius:8px; box-shadow:0 1px 4px rgba(0,0,0,0.2);
+      font: 12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    }}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="summary" id="summary">Rendering {len(rows)} points…</div>
+
+  <script>
+    const points = {data_json};
+
+    // Center on mean lat/lon if available
+    function mean(arr){ return arr.reduce((a,b)=>a+b,0)/Math.max(1,arr.length); }
+    const lats = points.map(p => Number(p.lat)).filter(v => !Number.isNaN(v));
+    const lons = points.map(p => Number(p.lon)).filter(v => !Number.isNaN(v));
+    const center = [ (lats.length? mean(lats): 30.0), (lons.length? mean(lons): -95.0) ];
+
+    const map = L.map('map').setView(center, 8);
+    L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
+      {{ attribution: '© OpenStreetMap contributors' }}
+    ).addTo(map);
+
+    const cluster = L.markerClusterGroup({ disableClusteringAtZoom: 11 });
+
+    function colorForAlt(a){ 
+      if (a < 12000) return '#ffe633';
+      if (a < 14000) return '#ffc300';
+      if (a < 16000) return '#ff5733';
+      return '#c70039';
+    }
+
+    const heatPts = [];
+    let minLat=+90, maxLat=-90, minLon=+180, maxLon=-180;
+    points.forEach(p => {{
+      const lat = Number(p.lat), lon = Number(p.lon), alt = Number(p.alt);
+      if (Number.isNaN(lat) || Number.isNaN(lon)) return;
+
+      minLat = Math.min(minLat, lat); maxLat = Math.max(maxLat, lat);
+      minLon = Math.min(minLon, lon); maxLon = Math.max(maxLon, lon);
+
+      const c = colorForAlt(alt);
+      const m = L.circleMarker([lat, lon], {{
+        radius: 5,
+        color: c, fillColor: c, fillOpacity: 0.9, opacity: 1, weight: 1
+      }}).bindPopup(
+        `<b>Alt:</b> ${isFinite(alt)? alt : 'n/a'} m<br>` +
+        `<b>Lat/Lon:</b> ${lat.toFixed(4)}, ${lon.toFixed(4)}`
+        {"+ (p.hasOwnProperty('"+time_col+"') && '"+time_col+"' !== '(none)' ? " + 
+          "`<br><b>Time:</b> ${String(p['"+time_col+"'])}`" + " : '')" }
+      );
+
+      cluster.addLayer(m);
+
+      // Heat intensity ~ scaled altitude (soft)
+      const intensity = isFinite(alt) ? Math.max(0.3, Math.min(1, (alt-2000)/12000)) : 0.4;
+      heatPts.push([lat, lon, intensity]);
+    }});
+
+    cluster.addTo(map);
+    const heat = L.heatLayer(heatPts, {{ radius: 22, blur: 18, maxZoom: 11 }});
+    // Toggle heat on by default? Comment out next line to start with markers only
+    // heat.addTo(map);
+
+    // Fit bounds to data (with padding)
+    if (isFinite(minLat) && isFinite(maxLat) && isFinite(minLon) && isFinite(maxLon)) {{
+      const pad = 0.05;
+      map.fitBounds([[minLat - pad, minLon - pad], [maxLat + pad, maxLon + pad]]);
+    }}
+
+    document.getElementById('summary').innerHTML = 
+      `<b>Rendered:</b> ${points.length} points<br>` +
+      `<b>Extent:</b> lat ${minLat.toFixed(3)}…${maxLat.toFixed(3)}, lon ${minLon.toFixed(3)}…${maxLon.toFixed(3)}`;
+  </script>
+</body>
+</html>
+    """, height=720, scrolling=False)
 
 # ---------------------------
-# preview / download
+# Data Preview & Export
 # ---------------------------
 with st.expander("Preview parsed table"):
     st.dataframe(plot_df.head(500), use_container_width=True)
@@ -299,6 +316,6 @@ st.download_button(
 )
 
 st.caption(
-    "Notes: Parser detects HLMA '*** data ***' and reads only numeric rows after it; "
-    "longitudes in 0..360 are wrapped to -180..180 for mapping."
+    "Notes: Longitudes in 0..360 are wrapped to -180..180 for mapping. "
+    "If auto-detection picks wrong columns, fix them in the sidebar."
 )
