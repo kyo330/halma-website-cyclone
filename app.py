@@ -1,292 +1,319 @@
-# app.py
-# Streamlit app to upload an HLMA/LYLOUT .dat file and plot points on a map
-# Run: streamlit run app.py
-
 import io
-import re
+import gzip
+import math
+import textwrap
+from pathlib import Path
+
+import numpy as np
 import pandas as pd
-import pydeck as pdk
 import streamlit as st
+import pydeck as pdk
 
-st.set_page_config(page_title=".dat → Map (HLMA Lightning)", layout="wide")
-st.title("HLMA .dat → Interactive Map")
-st.caption("Upload a LYLOUT/HLMA exported .dat file. I’ll parse latitude/longitude and plot the points.")
+# ---------------------------
+# Page config
+# ---------------------------
+st.set_page_config(
+    page_title="HLMA Lightning Mapper (.dat)",
+    layout="wide",
+)
 
-# -------------------------------
+st.title("⚡ HLMA Lightning — .dat Uploader & Map")
+st.caption(
+    "Upload an HLMA .dat or .dat.gz file, map the strikes, and explore with filters."
+)
+
+# ---------------------------
 # Helpers
-# -------------------------------
+# ---------------------------
 
-def _read_text(file) -> str:
-    """Read uploaded file-like to text with tolerant decoding."""
-    raw = file.getvalue() if hasattr(file, "getvalue") else file.read()
-    try:
-        return raw.decode("utf-8")
-    except Exception:
-        return raw.decode("latin-1", errors="replace")
+def _is_gz(bytes_buf: bytes) -> bool:
+    """Return True if bytes look like a gzip file."""
+    return len(bytes_buf) >= 2 and bytes_buf[0] == 0x1F and bytes_buf[1] == 0x8B
 
-def _parse_dat(text: str) -> pd.DataFrame:
-    """
-    Robust for NM Tech LMA 'Selected Data' exports.
-    Parses AFTER the `*** data ***` marker into:
-      time_sec, lat, lon, alt_m, chi2, nstations, p_dbw, mask
-    Falls back to generic whitespace parsing with on_bad_lines='skip'.
-    """
-    lines = text.splitlines()
 
-    # Prefer the explicit data block
-    start_idx = None
-    for i, line in enumerate(lines[:200]):
-        if line.strip().lower().startswith("*** data ***"):
-            start_idx = i + 1
-            break
-
-    if start_idx is not None:
-        rows = []
-        for ln in lines[start_idx:]:
-            s = ln.strip()
-            if not s or s.startswith("#"):
-                continue
-            low = s.lower()
-            if low.startswith("flash stats") or low.startswith("number of events"):
-                break
-            toks = s.split()
-            if len(toks) >= 7:                 # accept ragged rows ≥7 tokens
-                toks = (toks + [None]*8)[:8]   # pad/truncate to 8 cols
-                rows.append(toks)
-        if rows:
-            df = pd.DataFrame(
-                rows,
-                columns=["time_sec","lat","lon","alt_m","chi2","nstations","p_dbw","mask"]
-            )
-            for c in ["time_sec","lat","lon","alt_m","chi2","nstations","p_dbw"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            return df
-
-    # Fallback: generic whitespace parsing, skipping bad lines
-    sio = io.StringIO(text)
-
-    # Detect if first non-comment looks like a header
-    first_non_comment = None
-    for _ in range(50):
-        line = sio.readline()
-        if not line:
-            break
-        if not line.lstrip().startswith("#") and line.strip():
-            first_non_comment = line
-            break
-    has_header = bool(first_non_comment and re.search(r"[A-Za-z]", first_non_comment))
-
-    sio2 = io.StringIO(text)
-    df = pd.read_csv(
-        sio2, sep=r"\s+", engine="python", comment="#",
-        header=0 if has_header else None, on_bad_lines="skip"
-    )
-    return df.dropna(axis=1, how="all")
-
-LAT_NAMES = ["lat", "latitude", "y_deg", "y", "lat_deg"]
-LON_NAMES = ["lon", "long", "longitude", "x_deg", "x", "lng"]
-ALT_NAMES = ["alt", "altitude", "height", "z", "agl", "msl"]
-TIME_NAMES = ["time", "timestamp", "datetime", "utc", "date", "epoch", "msec", "nsec"]
-
-def _find_coord_columns(df: pd.DataFrame):
-    """Return (lat_col, lon_col, alt_col?, time_col?) using header names or value ranges."""
-    cols = list(df.columns)
-    lower = [str(c).strip().lower() for c in cols]
-
-    def _match(candidates):
-        for alias in candidates:
-            for i, name in enumerate(lower):
-                if name == alias or re.search(rf"\b{re.escape(alias)}\b", name):
-                    return cols[i]
-        return None
-
-    lat_col = _match(LAT_NAMES)
-    lon_col = _match(LON_NAMES)
-    alt_col = _match(ALT_NAMES)
-    time_col = _match(TIME_NAMES)
-
-    # If not found by name, infer by numeric ranges
-    if lat_col is None or lon_col is None:
-        numeric = df.select_dtypes(include=["number"])
-        cand_lat, cand_lon = None, None
-        for c in numeric.columns:
-            s = pd.to_numeric(numeric[c], errors="coerce")
-            vmin, vmax = s.min(), s.max()
-            if pd.isna(vmin) or pd.isna(vmax):
-                continue
-            if -90.5 <= vmin <= 90.5 and -90.5 <= vmax <= 90.5:
-                cand_lat = cand_lat or c
-            if -181 <= vmin <= 181 and -181 <= vmax <= 181 and c != cand_lat:
-                cand_lon = cand_lon or c
-        if lat_col is None and cand_lat is not None:
-            lat_col = cand_lat
-        if lon_col is None and cand_lon is not None:
-            lon_col = cand_lon
-        if (lat_col is None or lon_col is None) and numeric.shape[1] >= 2:
-            c1, c2 = numeric.columns[:2]
-            lat_col = lat_col or c2  # often (lon, lat)
-            lon_col = lon_col or c1
-
-    return lat_col, lon_col, alt_col, time_col
-
-def _coerce_time(series: pd.Series) -> pd.Series:
-    """Try ISO or epoch (s/ms/us/ns)."""
-    s = pd.to_numeric(series, errors="coerce")
-    if s.notna().any():
-        maxv = s.max()
-        unit = "s"
-        if maxv > 1e14:
-            unit = "ns"
-        elif maxv > 1e11:
-            unit = "ms"
-        elif maxv > 1e8:
-            unit = "s"
-        try:
-            return pd.to_datetime(s, unit=unit, errors="coerce", utc=True)
-        except Exception:
-            pass
-    return pd.to_datetime(series, errors="coerce", utc=True)
-
-# -------------------------------
-# UI
-# -------------------------------
-left, right = st.columns([2, 1])
-
-with left:
-    uploaded = st.file_uploader(
-        "Upload .dat (or .txt/.csv)", type=["dat", "txt", "csv"], accept_multiple_files=False
-    )
-
-    if uploaded is not None:
-        text = _read_text(uploaded)
-        try:
-            df = _parse_dat(text)
-        except Exception as e:
-            st.error("Failed to parse file.")
-            st.exception(e)  # show full traceback in the app
-            st.stop()
-
-        if df.empty:
-            st.error("Couldn't read any tabular data from the file. Is it the 'Selected Data' export?")
-            st.stop()
-
-        # Quick sanity print so you know it parsed
-        st.write("Parsed rows:", len(df), "Columns:", list(df.columns))
-
-        lat_col, lon_col, alt_col, time_col = _find_coord_columns(df)
-        if lat_col is None or lon_col is None:
-            st.warning(
-                "I couldn't confidently detect latitude/longitude columns. "
-                "Use the selectors in the sidebar to pick them."
-            )
-
-        st.session_state["raw_df"] = df
-        st.session_state["autodetected"] = {
-            "lat": lat_col, "lon": lon_col, "alt": alt_col, "time": time_col
-        }
-
-with right:
-    st.subheader("Settings")
-    if "raw_df" not in st.session_state:
-        st.info("Upload a file to configure settings.")
+def _open_text_from_upload(uploaded) -> io.StringIO:
+    """Return a text stream from an uploaded file (supports .gz)."""
+    raw = uploaded.read()
+    if _is_gz(raw) or str(uploaded.name).lower().endswith(".gz"):
+        with gzip.GzipFile(fileobj=io.BytesIO(raw)) as gz:
+            text = gz.read().decode("utf-8", errors="replace")
     else:
-        df = st.session_state["raw_df"].copy()
-        detected = st.session_state["autodetected"]
-        cols = list(df.columns)
+        text = raw.decode("utf-8", errors="replace")
+    return io.StringIO(text)
 
-        lat_choice = st.selectbox(
-            "Latitude column", options=[None] + cols,
-            index=(cols.index(detected["lat"]) + 1) if detected["lat"] in cols else 0,
-        )
-        lon_choice = st.selectbox(
-            "Longitude column", options=[None] + cols,
-            index=(cols.index(detected["lon"]) + 1) if detected["lon"] in cols else 0,
-        )
-        alt_choice = st.selectbox(
-            "Altitude column (optional)", options=[None] + cols,
-            index=(cols.index(detected["alt"]) + 1) if detected["alt"] in cols else 0,
-        )
-        time_choice = st.selectbox(
-            "Time column (optional)", options=[None] + cols,
-            index=(cols.index(detected["time"]) + 1) if detected["time"] in cols else 0,
-        )
 
-        size_px = st.slider("Point radius (meters)", 30, 2000, 150)
-        opacity = st.slider("Opacity", 0.05, 1.0, 0.7)
+def _detect_header_and_sep(sample_text: str):
+    """Heuristically detect if a header is present and choose a separator.
 
-        if alt_choice is not None:
-            alt_vals = pd.to_numeric(df[alt_choice], errors="coerce")
-            alt_min, alt_max = float(pd.Series(alt_vals).quantile(0.01)), float(pd.Series(alt_vals).quantile(0.99))
-            r = st.slider("Altitude range", min_value=alt_min, max_value=alt_max, value=(alt_min, alt_max))
+    Returns: (has_header: bool, sep: str | None, delim_whitespace: bool)
+    """
+    # Find first non-comment, non-empty line
+    first_data_line = None
+    for ln in sample_text.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        first_data_line = s
+        break
+
+    # Default assumptions
+    has_header = False
+    sep = None
+    delim_ws = False
+
+    if first_data_line is None:
+        return has_header, sep, True
+
+    # If commas appear, use comma sep; otherwise treat as whitespace
+    if "," in first_data_line:
+        sep = ","
+        tokens = [t.strip() for t in first_data_line.split(",")]
+    else:
+        delim_ws = True
+        tokens = first_data_line.split()
+
+    # If any token is non-numeric, likely a header
+    def _is_num(tok: str) -> bool:
+        try:
+            float(tok)
+            return True
+        except Exception:
+            return False
+
+    non_num = sum(0 if _is_num(t) else 1 for t in tokens)
+    has_header = non_num >= max(1, len(tokens) // 3)
+    return has_header, sep, delim_ws
+
+
+def _read_dat_to_df(uploaded) -> pd.DataFrame:
+    """Parse .dat/.dat.gz into a DataFrame, skipping comment lines.
+
+    The function tries (1) detected header; (2) user-provided mapping if needed.
+    """
+    sio = _open_text_from_upload(uploaded)
+    # Keep a small sample for detection
+    sample = sio.getvalue()[:10_000]
+    has_header, sep, delim_ws = _detect_header_and_sep(sample)
+
+    # Reset pointer and read
+    sio.seek(0)
+    try:
+        if delim_ws:
+            df = pd.read_csv(
+                sio,
+                comment="#",
+                header=0 if has_header else None,
+                delim_whitespace=True,
+                engine="python",
+            )
         else:
-            r = None
+            df = pd.read_csv(
+                sio,
+                comment="#",
+                header=0 if has_header else None,
+                sep=sep,
+                engine="python",
+            )
+    except Exception as e:
+        # Fallback: split on any whitespace or comma
+        sio.seek(0)
+        df = pd.read_csv(
+            sio,
+            comment="#",
+            header=0 if has_header else None,
+            sep=r"\s+|,",
+            engine="python",
+        )
 
-        if time_choice is not None:
-            times = _coerce_time(df[time_choice])
-            tmin, tmax = times.min(), times.max()
-            t1 = st.text_input("Start time (ISO, optional)", value=str(tmin) if pd.notna(tmin) else "")
-            t2 = st.text_input("End time (ISO, optional)", value=str(tmax) if pd.notna(tmax) else "")
-        else:
-            t1 = t2 = None
+    # Assign generic column names if there's no header
+    if df.columns.dtype == "int64" or any(isinstance(c, (int, np.integer)) for c in df.columns):
+        df.columns = [f"col_{i}" for i in range(len(df.columns))]
 
-        if lat_choice is not None and lon_choice is not None:
-            gdf = pd.DataFrame({
-                "lat": pd.to_numeric(df[lat_choice], errors="coerce"),
-                "lon": pd.to_numeric(df[lon_choice], errors="coerce"),
-            })
-            if alt_choice is not None:
-                gdf["altitude"] = pd.to_numeric(df[alt_choice], errors="coerce")
-            if time_choice is not None:
-                gdf["time"] = _coerce_time(df[time_choice])
+    return df
 
-            gdf = gdf.dropna(subset=["lat", "lon"]).query("-90 <= lat <= 90 and -180 <= lon <= 180")
 
-            if r is not None and "altitude" in gdf:
-                gdf = gdf[(gdf["altitude"] >= r[0]) & (gdf["altitude"] <= r[1])]
-            if t1 and t2 and "time" in gdf:
-                try:
-                    tstart = pd.to_datetime(t1, utc=True)
-                    tend = pd.to_datetime(t2, utc=True)
-                    gdf = gdf[(gdf["time"] >= tstart) & (gdf["time"] <= tend)]
-                except Exception:
-                    pass
+def _coerce_numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce")
 
-            st.markdown("### Preview")
-            st.dataframe(gdf.head(500))
 
-            if not gdf.empty:
-                center = [float(gdf["lat"].mean()), float(gdf["lon"].mean())]
-                view_state = pdk.ViewState(latitude=center[0], longitude=center[1], zoom=7, pitch=0)
+def _lon_wrap(lon: pd.Series) -> pd.Series:
+    """Wrap longitudes to [-180, 180] if they look like [0, 360]."""
+    s = lon.copy()
+    if s.max(skipna=True) > 180 and s.min(skipna=True) >= 0:
+        s = ((s + 180) % 360) - 180
+    return s
 
-                layer = pdk.Layer(
-                    "ScatterplotLayer",
-                    data=gdf,
-                    get_position="[lon, lat]",
-                    get_radius=size_px,
-                    get_fill_color="[0, 0, 0]",
-                    pickable=True,
-                    opacity=opacity,
-                    radius_min_pixels=1,
-                )
 
-                deck = pdk.Deck(
-                    layers=[layer],
-                    initial_view_state=view_state,
-                    map_style="mapbox://styles/mapbox/light-v9",
-                )
-                st.pydeck_chart(deck, use_container_width=True)
+def _initial_view(df: pd.DataFrame, lat_col: str, lon_col: str):
+    lat = df[lat_col].astype(float)
+    lon = df[lon_col].astype(float)
+    lat_m = float(np.nanmean(lat)) if len(lat) else 0.0
+    lon_m = float(np.nanmean(lon)) if len(lon) else 0.0
+    return pdk.ViewState(latitude=lat_m, longitude=lon_m, zoom=6, pitch=0)
 
-                csv = gdf.to_csv(index=False).encode("utf-8")
-                st.download_button("Download parsed CSV", data=csv, file_name="parsed_points.csv", mime="text/csv")
-            else:
-                st.warning("No valid coordinate rows to plot after filtering.")
-        else:
-            st.info("Select the latitude and longitude columns to plot.")
 
-st.markdown("---")
-st.markdown(
-    "**Notes**:\n\n"
-    "• If column names aren't present, the app guesses lat/lon using numeric ranges.\n\n"
-    "• Optional altitude/time columns (if selected) enable simple filtering.\n\n"
-    "• Map uses PyDeck/Deck.GL; drag to pan, scroll to zoom, hover for tooltips."
+# ---------------------------
+# Sidebar — Upload & Mapping
+# ---------------------------
+with st.sidebar:
+    st.header("1) Upload .dat / .dat.gz")
+    up = st.file_uploader(
+        "Choose a .dat or .dat.gz file",
+        type=["dat", "gz"],
+        accept_multiple_files=False,
+    )
+
+    st.header("2) Column Mapping")
+    st.caption(
+        "If your file has headers like 'lat'/'lon', I'll detect them. Otherwise, pick the columns below."
+    )
+
+# Work area
+if up is None:
+    st.info(
+        "Upload an HLMA .dat (or .dat.gz) file in the sidebar to begin.\n\n"
+        "Tip: comment lines starting with '#' are ignored."
+    )
+    st.stop()
+
+# Parse
+raw_df = _read_dat_to_df(up)
+
+# Auto-detect likely latitude/longitude column names
+lower_names = {c.lower(): c for c in raw_df.columns.astype(str)}
+
+cand_lat = [
+    n for n in ["lat", "latitude", "lat_deg", "y", "phi", "col_1", "col_2"] if n in lower_names
+]
+cand_lon = [
+    n for n in ["lon", "longitude", "long", "lon_deg", "x", "lambda", "col_0", "col_3"] if n in lower_names
+]
+
+lat_default = lower_names.get(cand_lat[0], None) if cand_lat else None
+lon_default = lower_names.get(cand_lon[0], None) if cand_lon else None
+
+with st.sidebar:
+    col_options = list(raw_df.columns.astype(str))
+    lat_col = st.selectbox("Latitude column", options=col_options, index=(col_options.index(lat_default) if lat_default in col_options else 0))
+    lon_col = st.selectbox("Longitude column", options=col_options, index=(col_options.index(lon_default) if lon_default in col_options else min(1, len(col_options)-1)))
+    alt_col = st.selectbox("Altitude column (optional)", options=["(none)"] + col_options, index=0)
+    time_col = st.selectbox("Time column (optional)", options=["(none)"] + col_options, index=0)
+
+# Clean and coerce
+work_df = raw_df.copy()
+work_df[lat_col] = _coerce_numeric(work_df[lat_col])
+work_df[lon_col] = _coerce_numeric(work_df[lon_col])
+if alt_col != "(none)":
+    work_df[alt_col] = _coerce_numeric(work_df[alt_col])
+else:
+    work_df["altitude_m"] = np.nan
+    alt_col = "altitude_m"
+
+# Wrap longitudes if in 0..360
+after_wrap = _lon_wrap(work_df[lon_col])
+work_df[lon_col] = after_wrap
+
+# Drop invalid rows
+work_df = work_df[np.isfinite(work_df[lat_col]) & np.isfinite(work_df[lon_col])].copy()
+
+if work_df.empty:
+    st.error(
+        "No valid latitude/longitude rows found after parsing. Check the column mapping and try again."
+    )
+    st.stop()
+
+# ---------------------------
+# Sidebar — Filters
+# ---------------------------
+with st.sidebar:
+    st.header("3) Filters")
+    lat_min = float(np.nanmin(work_df[lat_col]))
+    lat_max = float(np.nanmax(work_df[lat_col]))
+    lon_min = float(np.nanmin(work_df[lon_col]))
+    lon_max = float(np.nanmax(work_df[lon_col]))
+
+    lat_rng = st.slider("Latitude range", min_value=lat_min, max_value=lat_max, value=(lat_min, lat_max))
+    lon_rng = st.slider("Longitude range", min_value=lon_min, max_value=lon_max, value=(lon_min, lon_max))
+
+    alt_rng = None
+    if alt_col:
+        a_min = float(np.nanmin(work_df[alt_col])) if work_df[alt_col].notna().any() else 0.0
+        a_max = float(np.nanmax(work_df[alt_col])) if work_df[alt_col].notna().any() else 0.0
+        if a_min != a_max:
+            alt_rng = st.slider(
+                "Altitude range (units as in file)",
+                min_value=a_min,
+                max_value=a_max,
+                value=(a_min, a_max),
+            )
+
+# Apply filters
+flt = (
+    (work_df[lat_col].between(lat_rng[0], lat_rng[1]))
+    & (work_df[lon_col].between(lon_rng[0], lon_rng[1]))
+)
+if alt_rng is not None:
+    flt &= work_df[alt_col].between(alt_rng[0], alt_rng[1])
+
+plot_df = work_df.loc[flt, [lat_col, lon_col, alt_col] + ([time_col] if time_col != "(none)" else [])].copy()
+plot_df.rename(columns={lat_col: "lat", lon_col: "lon", alt_col: "alt"}, inplace=True)
+
+st.success(f"Parsed rows: {len(work_df):,} • Plotted rows: {len(plot_df):,}")
+
+# ---------------------------
+# Map
+# ---------------------------
+if plot_df.empty:
+    st.warning("No points within the selected filters.")
+else:
+    view = _initial_view(plot_df, "lat", "lon")
+
+    # Build tooltip text
+    def build_tooltip(row):
+        parts = [f"lat: {row['lat']:.4f}", f"lon: {row['lon']:.4f}"]
+        if not (np.isnan(row.get("alt", np.nan))):
+            parts.append(f"alt: {row['alt']}")
+        if time_col != "(none)":
+            tval = row.get(time_col)
+            parts.append(f"time: {tval}")
+        return " | ".join(parts)
+
+    plot_df["tooltip"] = plot_df.apply(build_tooltip, axis=1)
+
+    layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=plot_df,
+        get_position="[lon, lat]",
+        get_radius=1000,  # meters; adjust as needed
+        auto_highlight=True,
+        pickable=True,
+        opacity=0.6,
+    )
+
+    deck = pdk.Deck(
+        layers=[layer],
+        initial_view_state=view,
+        map_style="mapbox://styles/mapbox/light-v11",
+        tooltip={"text": "{tooltip}"},
+    )
+
+    st.pydeck_chart(deck, use_container_width=True)
+
+# ---------------------------
+# Data Preview & Export
+# ---------------------------
+with st.expander("Preview parsed table"):
+    st.dataframe(plot_df.head(500), use_container_width=True)
+
+csv = plot_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    "Download filtered CSV",
+    data=csv,
+    file_name=(Path(up.name).stem + "_filtered.csv"),
+    mime="text/csv",
+)
+
+st.caption(
+    "Notes: If your longitudes are 0..360 they are wrapped to -180..180 for mapping. "
+    "If auto-detection picks wrong columns, fix them in the sidebar."
 )
