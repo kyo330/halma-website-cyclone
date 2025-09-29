@@ -24,7 +24,6 @@ def _is_gz(bytes_buf: bytes) -> bool:
     """Return True if bytes look like a gzip file."""
     return len(bytes_buf) >= 2 and bytes_buf[0] == 0x1F and bytes_buf[1] == 0x8B
 
-
 def _open_text_from_upload(uploaded) -> io.StringIO:
     """Return a text stream from an uploaded file (supports .gz)."""
     raw = uploaded.read()
@@ -35,71 +34,96 @@ def _open_text_from_upload(uploaded) -> io.StringIO:
         text = raw.decode("utf-8", errors="replace")
     return io.StringIO(text)
 
-
-def _read_dat_to_df(uploaded) -> pd.DataFrame:
+def _read_hlma_block(s: str) -> pd.DataFrame | None:
     """
-    Robust .dat/.dat.gz parser that tolerates ragged rows & mixed delimiters.
-
-    Strategy:
-      1) Remove comment/blank lines and try sep=None (csv.Sniffer) with engine='python'.
-      2) Fallback to regex split on whitespace OR comma (r"\\s+|,").
-      3) Last resort: manual split; coerce each row to the most common column count.
-    Also normalizes/creates column names and drops fully empty columns.
+    HLMA-export aware parser:
+      - find '*** data ***'
+      - keep only rows AFTER it that start with a number
+      - drop literal '...' lines
+      - parse as whitespace-delimited (8 columns typical)
+      - assign HLMA column names
     """
-    sio = _open_text_from_upload(uploaded)
-    full_text = sio.getvalue()
+    lines_all = s.splitlines()
+    # locate sentinel
+    start_idx = None
+    for i, ln in enumerate(lines_all):
+        if '*** data ***' in ln.lower():
+            start_idx = i + 1
+            break
+    if start_idx is None:
+        return None  # not an HLMA-export structure
 
-    # Keep only data lines (no comments / blanks)
-    data_lines = [ln for ln in full_text.splitlines()
-                  if ln.strip() and not ln.lstrip().startswith('#')]
+    num_pat = re.compile(r'^\s*[+-]?\d')
+    data_lines = []
+    for ln in lines_all[start_idx:]:
+        if not ln.strip():
+            continue
+        if ln.strip() == '...':
+            continue
+        if not num_pat.match(ln):
+            continue
+        data_lines.append(ln)
+
     if not data_lines:
-        return pd.DataFrame(columns=["col_0", "col_1"])
+        return pd.DataFrame()
 
-    # Heuristic header detection: if many tokens are non-numeric, assume header
-    first = data_lines[0].strip()
-    toks = re.split(r"\s+|,", first)
-    def _isnum(x):
-        try:
-            float(x)
-            return True
-        except Exception:
-            return False
-    non_num = sum(0 if _isnum(t) else 1 for t in toks if t != "")
-    has_header = non_num >= max(1, len([t for t in toks if t != ""]) // 3)
+    # Parse all data lines as whitespace-delimited
+    df = pd.read_csv(
+        io.StringIO("\n".join(data_lines)),
+        sep=r"\s+",
+        engine="python",
+        header=None,
+        on_bad_lines="skip",
+        skip_blank_lines=True,
+    )
 
-    # Attempt 1: sep=None (Sniffer)
+    # Typical HLMA export has 8 columns (time, lat, lon, alt, chi2, nstations, p_dbw, mask)
+    # If column count differs, we still proceed but name what we can.
+    names_8 = ["time_uts", "lat", "lon", "alt_m", "chi2", "nstations", "p_dbw", "mask"]
+    if df.shape[1] == 8:
+        df.columns = names_8
+    else:
+        df.columns = [f"col_{i}" for i in range(df.shape[1])]
+        # If we have at least 4 numeric columns, map the first four to HLMA names
+        if df.shape[1] >= 4:
+            rename_map = {df.columns[0]: "time_uts",
+                          df.columns[1]: "lat",
+                          df.columns[2]: "lon",
+                          df.columns[3]: "alt_m"}
+            df = df.rename(columns=rename_map)
+
+    return df
+
+def _generic_parse(s: str) -> pd.DataFrame:
+    """Generic robust parser for non-HLMA files."""
+    # Remove comment/blank lines for detection
+    data_lines = [ln for ln in s.splitlines() if ln.strip() and not ln.lstrip().startswith('#')]
+    if not data_lines:
+        return pd.DataFrame()
+
+    # Try sep=None (csv.Sniffer)
     df = None
     try:
-        buf1 = io.StringIO("\n".join(data_lines))
-        df = pd.read_csv(
-            buf1,
-            sep=None,                 # auto-detect delimiter
-            engine="python",
-            header=0 if has_header else None,
-            on_bad_lines="skip",      # pandas >= 1.3
-            skip_blank_lines=True,
-        )
+        df = pd.read_csv(io.StringIO("\n".join(data_lines)),
+                         sep=None, engine="python",
+                         header=None,
+                         on_bad_lines="skip", skip_blank_lines=True)
     except Exception:
         df = None
 
-    # Attempt 2: regex delimiter (whitespace OR comma)
+    # Fallback: regex whitespace or comma
     if df is None or df.empty:
         try:
-            buf2 = io.StringIO("\n".join(data_lines))
-            df = pd.read_csv(
-                buf2,
-                sep=r"\s+|,",
-                engine="python",
-                header=0 if has_header else None,
-                on_bad_lines="skip",
-                skip_blank_lines=True,
-            )
+            df = pd.read_csv(io.StringIO("\n".join(data_lines)),
+                             sep=r"\s+|,", engine="python",
+                             header=None,
+                             on_bad_lines="skip", skip_blank_lines=True)
         except Exception:
             df = None
 
-    # Attempt 3: manual split -> normalize to most-common width
+    # Last resort: manual split normalized to most-common width
     if df is None or df.empty:
-        splitter = re.compile(r"[,\s]+")
+        splitter = re.compile(r"[, \t]+")
         rows, widths = [], []
         for ln in data_lines:
             parts = [p for p in splitter.split(ln.strip()) if p != ""]
@@ -107,7 +131,7 @@ def _read_dat_to_df(uploaded) -> pd.DataFrame:
                 rows.append(parts)
                 widths.append(len(parts))
         if not rows:
-            return pd.DataFrame(columns=["col_0", "col_1"])
+            return pd.DataFrame()
         most_w = Counter(widths).most_common(1)[0][0]
         fixed = []
         for parts in rows:
@@ -117,32 +141,42 @@ def _read_dat_to_df(uploaded) -> pd.DataFrame:
                 parts = parts[:most_w]
             fixed.append(parts)
         df = pd.DataFrame(fixed)
-        if has_header and len(df) >= 1:
-            df.columns = [c if str(c).strip() != "" else f"col_{i}" for i, c in enumerate(df.iloc[0])]
-            df = df.drop(df.index[0]).reset_index(drop=True)
 
-    # Drop fully-empty columns
-    if not df.empty:
-        df = df.dropna(axis=1, how="all")
-
-    # Normalize column names
+    # Name columns if unnamed
     if df.columns.dtype == "int64" or any(isinstance(c, (int, np.integer)) for c in df.columns):
         df.columns = [f"col_{i}" for i in range(len(df.columns))]
-    else:
-        new_cols = []
-        for i, c in enumerate(df.columns):
-            cn = str(c)
-            if cn.lower().startswith("unnamed") or cn.strip() == "":
-                cn = f"col_{i}"
-            new_cols.append(cn)
-        df.columns = new_cols
+    return df
+
+def _read_dat_to_df(uploaded) -> pd.DataFrame:
+    """
+    Unified entry:
+      - Try HLMA-aware parsing (*** data *** sentinel)
+      - Else, use generic robust parsing
+    """
+    sio = _open_text_from_upload(uploaded)
+    text = sio.getvalue()
+
+    df = _read_hlma_block(text)
+    if df is None:
+        df = _generic_parse(text)
+
+    # Final cleanups
+    if df.empty:
+        return df
+
+    # Normalize any Unnamed columns
+    new_cols = []
+    for i, c in enumerate(df.columns):
+        cn = str(c)
+        if cn.lower().startswith("unnamed") or cn.strip() == "":
+            cn = f"col_{i}"
+        new_cols.append(cn)
+    df.columns = new_cols
 
     return df
 
-
 def _coerce_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
-
 
 def _lon_wrap(lon: pd.Series) -> pd.Series:
     """Wrap longitudes to [-180, 180] if they look like [0, 360]."""
@@ -151,13 +185,12 @@ def _lon_wrap(lon: pd.Series) -> pd.Series:
         s = ((s + 180) % 360) - 180
     return s
 
-
 def _initial_view(df: pd.DataFrame, lat_col: str, lon_col: str):
     lat = df[lat_col].astype(float)
     lon = df[lon_col].astype(float)
     lat_m = float(np.nanmean(lat)) if len(lat) else 0.0
     lon_m = float(np.nanmean(lon)) if len(lon) else 0.0
-    return pdk.ViewState(latitude=lat_m, longitude=lon_m, zoom=6, pitch=0)
+    return pdk.ViewState(latitude=lat_m, longitude=lon_m, zoom=7, pitch=0)
 
 # ---------------------------
 # Sidebar — Upload & Mapping
@@ -175,20 +208,34 @@ with st.sidebar:
 
 if up is None:
     st.info("Upload an HLMA .dat (or .dat.gz) file in the sidebar to begin.\n\n"
-            "Tip: comment lines starting with '#' are ignored.")
+            "Tip: header block and '*** data ***' are handled automatically.")
     st.stop()
 
-# Parse (robust)
+# Parse (robust; HLMA-aware)
 raw_df = _read_dat_to_df(up)
 
-# Auto-detect likely latitude/longitude column names
-lower_names = {str(c).lower(): str(c) for c in raw_df.columns}
-
-cand_lat = [n for n in ["lat", "latitude", "lat_deg", "y", "phi", "col_1", "col_2"] if n in lower_names]
-cand_lon = [n for n in ["lon", "longitude", "long", "lon_deg", "x", "lambda", "col_0", "col_3"] if n in lower_names]
-
-lat_default = lower_names.get(cand_lat[0], None) if cand_lat else list(raw_df.columns)[0]
-lon_default = lower_names.get(cand_lon[0], None) if cand_lon else (list(raw_df.columns)[1] if len(raw_df.columns) > 1 else list(raw_df.columns)[0])
+# Auto defaults: prefer HLMA names if present, else guess
+if set(["lat", "lon"]).issubset(raw_df.columns):
+    lat_default = "lat"
+    lon_default = "lon"
+else:
+    # Guess by value ranges
+    lat_default = None
+    lon_default = None
+    for c in raw_df.columns:
+        s = pd.to_numeric(raw_df[c], errors="coerce")
+        if s.notna().mean() < 0.8:
+            continue
+        mn, mx = float(s.min()), float(s.max())
+        if lat_default is None and -90.5 <= mn <= 90.5 and -90.5 <= mx <= 90.5:
+            lat_default = c
+        if lon_default is None and -180.5 <= mn <= 360.5 and -180.5 <= mx <= 360.5:
+            lon_default = c
+    # Fallbacks
+    if lat_default is None and len(raw_df.columns) >= 2:
+        lat_default = raw_df.columns[1]
+    if lon_default is None and len(raw_df.columns) >= 3:
+        lon_default = raw_df.columns[2]
 
 with st.sidebar:
     col_options = list(raw_df.columns.astype(str))
@@ -196,8 +243,14 @@ with st.sidebar:
                            index=(col_options.index(lat_default) if lat_default in col_options else 0))
     lon_col = st.selectbox("Longitude column", options=col_options,
                            index=(col_options.index(lon_default) if lon_default in col_options else min(1, len(col_options)-1)))
-    alt_col = st.selectbox("Altitude column (optional)", options=["(none)"] + col_options, index=0)
-    time_col = st.selectbox("Time column (optional)", options=["(none)"] + col_options, index=0)
+    alt_candidates = [c for c in raw_df.columns if c.lower() in {"alt", "alt_m", "altitude", "altitude_m"}]
+    alt_default = alt_candidates[0] if alt_candidates else None
+    alt_col = st.selectbox("Altitude column (optional)", options=["(none)"] + col_options,
+                           index=(0 if alt_default is None else (col_options.index(alt_default)+1)))
+    time_candidates = [c for c in raw_df.columns if c.lower() in {"time", "time_uts", "time_sec", "t"}]
+    time_default = time_candidates[0] if time_candidates else None
+    time_col = st.selectbox("Time column (optional)", options=["(none)"] + col_options,
+                            index=(0 if time_default is None else (col_options.index(time_default)+1)))
 
 # Clean and coerce
 work_df = raw_df.copy()
@@ -216,7 +269,8 @@ work_df[lon_col] = _lon_wrap(work_df[lon_col])
 work_df = work_df[np.isfinite(work_df[lat_col]) & np.isfinite(work_df[lon_col])].copy()
 
 if work_df.empty:
-    st.error("No valid latitude/longitude rows found after parsing. Check the column mapping and try again.")
+    st.error("No valid latitude/longitude rows found after parsing. "
+             "If this is an HLMA export, ensure the file includes '*** data ***' and numeric rows after it.")
     st.stop()
 
 # ---------------------------
@@ -269,7 +323,7 @@ else:
         "ScatterplotLayer",
         data=plot_df,
         get_position="[lon, lat]",
-        get_radius=1000,
+        get_radius=800,   # meters; tweak as desired
         auto_highlight=True,
         pickable=True,
         opacity=0.6,
@@ -290,12 +344,20 @@ else:
 with st.expander("Preview parsed table"):
     st.dataframe(plot_df.head(500), use_container_width=True)
 
-with st.expander("Parsing debug — first 20 non-comment lines"):
+with st.expander("Parsing debug — first 20 non-comment lines after '*** data ***'"):
     try:
         sio_dbg = _open_text_from_upload(up)
-        lines_dbg = [ln for ln in sio_dbg.getvalue().splitlines()
-                     if ln.strip() and not ln.lstrip().startswith('#')]
-        st.code("\n".join(lines_dbg[:20]) or "(no data lines)", language="text")
+        text_dbg = sio_dbg.getvalue()
+        # Show only numeric rows after sentinel
+        lines = text_dbg.splitlines()
+        start_idx = 0
+        for i, ln in enumerate(lines):
+            if '*** data ***' in ln.lower():
+                start_idx = i + 1
+                break
+        num_pat = re.compile(r'^\s*[+-]?\d')
+        cleaned = [ln for ln in lines[start_idx:] if ln.strip() and ln.strip() != '...' and num_pat.match(ln)]
+        st.code("\n".join(cleaned[:20]) or "(no numeric data lines found)", language="text")
     except Exception:
         pass
 
@@ -308,6 +370,7 @@ st.download_button(
 )
 
 st.caption(
-    "Notes: If your longitudes are 0..360 they are wrapped to -180..180 for mapping. "
-    "If auto-detection picks wrong columns, fix them in the sidebar."
+    "Notes: This parser detects the HLMA '*** data ***' block and only parses numeric rows after it. "
+    "Longitudes in 0..360 are wrapped to -180..180 for mapping. "
+    "Adjust column picks in the sidebar if needed."
 )
