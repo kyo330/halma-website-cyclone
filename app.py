@@ -13,9 +13,9 @@ from streamlit.components.v1 import html as st_html
 # =========================
 # Page config
 # =========================
-st.set_page_config(page_title="HLMA Lightning — Leaflet Map with Storm Paths", layout="wide")
-st.title("⚡ HLMA Lightning — .dat Uploader & Map + 🌪️ Storm Paths (CSV)")
-st.caption("Upload an HLMA .dat/.dat.gz and optionally a storm search CSV to overlay paths and details.")
+st.set_page_config(page_title="HLMA Lightning — Clusters + Storm Paths", layout="wide")
+st.title("⚡ HLMA Lightning — Clusters + 🌪️ Storm Reports")
+st.caption("Upload HLMA .dat/.dat.gz for lightning and an optional storm CSV. Lightning is clustered; storms overlay as paths with start/end markers.")
 
 # =========================
 # Helpers
@@ -34,11 +34,7 @@ def _open_text_from_upload(uploaded) -> io.StringIO:
     return io.StringIO(text)
 
 def _read_hlma_block(text: str) -> pd.DataFrame | None:
-    """
-    HLMA export format:
-      header block, '*** data ***' sentinel, then numeric rows (often 8 cols):
-      time_uts lat lon alt_m chi2 nstations p_dbw mask
-    """
+    # HLMA export: header, *** data ***, rows; skip '...'
     lines = text.splitlines()
     start = None
     for i, ln in enumerate(lines):
@@ -47,7 +43,6 @@ def _read_hlma_block(text: str) -> pd.DataFrame | None:
             break
     if start is None:
         return None
-
     num_line = re.compile(r'^\s*[+-]?\d')
     data_lines = []
     for ln in lines[start:]:
@@ -57,36 +52,28 @@ def _read_hlma_block(text: str) -> pd.DataFrame | None:
         if not num_line.match(s):
             continue
         data_lines.append(ln)
-
     if not data_lines:
         return pd.DataFrame()
-
     try:
         df = pd.read_csv(io.StringIO("\n".join(data_lines)), sep=r"\s+", engine="python",
                          header=None, on_bad_lines="skip", skip_blank_lines=True)
     except TypeError:
         df = pd.read_csv(io.StringIO("\n".join(data_lines)), sep=r"\s+", engine="python",
                          header=None, error_bad_lines=False, warn_bad_lines=False, skip_blank_lines=True)
-
     if df.shape[1] == 8:
         df.columns = ["time_uts", "lat", "lon", "alt_m", "chi2", "nstations", "p_dbw", "mask"]
     else:
         df.columns = [f"col_{i}" for i in range(df.shape[1])]
         if df.shape[1] >= 4:
-            df = df.rename(columns={
-                df.columns[0]: "time_uts",
-                df.columns[1]: "lat",
-                df.columns[2]: "lon",
-                df.columns[3]: "alt_m",
-            })
+            df = df.rename(columns={df.columns[0]: "time_uts", df.columns[1]: "lat",
+                                    df.columns[2]: "lon", df.columns[3]: "alt_m"})
     return df
 
 def _generic_parse(text: str) -> pd.DataFrame:
     data_lines = [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
     if not data_lines:
         return pd.DataFrame()
-
-    # 1) Sniffer
+    # 1) sniffer
     try:
         df = pd.read_csv(io.StringIO("\n".join(data_lines)), sep=None, engine="python",
                          header=None, on_bad_lines="skip", skip_blank_lines=True)
@@ -98,8 +85,7 @@ def _generic_parse(text: str) -> pd.DataFrame:
             df = None
     except Exception:
         df = None
-
-    # 2) Regex sep
+    # 2) regex
     if df is None or df.empty:
         try:
             df = pd.read_csv(io.StringIO("\n".join(data_lines)), sep=r"\s+|,", engine="python",
@@ -112,8 +98,7 @@ def _generic_parse(text: str) -> pd.DataFrame:
                 df = None
         except Exception:
             df = None
-
-    # 3) Manual normalize
+    # 3) manual normalize
     if df is None or df.empty:
         splitter = re.compile(r"[, \t]+")
         rows, widths = [], []
@@ -133,7 +118,6 @@ def _generic_parse(text: str) -> pd.DataFrame:
                 parts = parts[:most_w]
             fixed.append(parts)
         df = pd.DataFrame(fixed)
-
     if df.columns.dtype == "int64" or any(isinstance(c, (int, np.integer)) for c in df.columns):
         df.columns = [f"col_{i}" for i in range(df.shape[1])]
     return df
@@ -146,16 +130,15 @@ def _read_dat_to_df(uploaded) -> pd.DataFrame:
         df = _generic_parse(text)
     if df.empty:
         return df
-    # Normalize any unnamed columns
-    df.columns = [f"col_{i}" if (str(c).strip() == "" or str(c).lower().startswith("unnamed"))
-                  else str(c) for i, c in enumerate(df.columns)]
+    # normalize unnamed
+    df.columns = [f"col_{i}" if (str(c).strip()=="" or str(c).lower().startswith("unnamed")) else str(c)
+                  for i, c in enumerate(df.columns)]
     return df
 
 def _coerce_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 def _lon_wrap(lon: pd.Series) -> pd.Series:
-    """Wrap longitudes to [-180, 180] if they look like [0, 360]."""
     s = lon.copy()
     if s.max(skipna=True) > 180 and s.min(skipna=True) >= 0:
         s = ((s + 180) % 360) - 180
@@ -170,10 +153,10 @@ with st.sidebar:
 
     st.header("2) Upload storm CSV (optional)")
     up_csv = st.file_uploader("CSV with storm paths (BEGIN_/END_ columns)", type=["csv"], accept_multiple_files=False)
-    st.caption("Expected columns: BEGIN_LAT/LON, END_LAT/LON (+ metadata).")
+    st.caption("Needs: BEGIN_LAT/LON, END_LAT/LON. Other fields (EF, length, width, etc.) are optional but shown if present.")
 
 if up_dat is None:
-    st.info("Upload an HLMA .dat/.dat.gz file to start. You can add a storm CSV afterward.")
+    st.info("Upload an HLMA .dat/.dat.gz file to start. Then add a storm CSV to overlay.")
     st.stop()
 
 # =========================
@@ -301,7 +284,7 @@ if up_csv is not None:
 st.success(f"Lightning parsed: {len(work_df):,} rows • Plotted: {len(plot_df):,} • Storm paths: {len(storm_rows)}")
 
 # =========================
-# Map (Leaflet via HTML; no f-strings)
+# Map (Leaflet with MarkerCluster for lightning)
 # =========================
 if plot_df.empty and not storm_rows:
     st.warning("Nothing to plot yet. Adjust filters or upload a storm CSV.")
@@ -322,11 +305,13 @@ else:
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
-  <!-- (Optional) Heatmap if needed later -->
-  <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+  <!-- MarkerCluster (for lightning) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 
   <style>
-    html, body, #map { height: 720px; margin: 0; padding: 0; }
+    html, body, #map { height: 740px; margin: 0; padding: 0; }
     .legend {
       position: absolute; bottom: 16px; left: 16px; z-index: 500;
       background: rgba(255,255,255,0.97); padding:10px 12px; border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,0.2);
@@ -346,6 +331,13 @@ else:
       font: 12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
     }
     .layers-box label { display:block; margin:4px 0; }
+
+    /* Tiny colored dot markers via divIcon */
+    .mk { width:10px; height:10px; border-radius:50%; border:1px solid rgba(0,0,0,0.4); }
+    .mk.low { background:#ffe633; }
+    .mk.med { background:#ffc300; }
+    .mk.high { background:#ff5733; }
+    .mk.extreme { background:#c70039; }
   </style>
 </head>
 <body>
@@ -353,8 +345,8 @@ else:
 
   <!-- Layer toggles -->
   <div class="layers-box">
-    <label><input type="checkbox" id="toggleLightning" checked> Show lightning points</label>
-    <label><input type="checkbox" id="toggleStorms" __STORMCHECK__> Show storm paths</label>
+    <label><input type="checkbox" id="toggleLightning" checked> Show lightning clusters</label>
+    <label><input type="checkbox" id="toggleStorms" __STORMCHECK__> Show storm reports</label>
   </div>
 
   <!-- Color legend -->
@@ -374,14 +366,14 @@ else:
     const storms = __STORMS__;
 
     function mean(arr){ return arr.reduce(function(a,b){return a+b;},0)/Math.max(1,arr.length); }
-    function colorForAlt(a){
-      if (a < 12000) return '#ffe633';
-      if (a < 14000) return '#ffc300';
-      if (a < 16000) return '#ff5733';
-      return '#c70039';
+    function tierForAlt(a){
+      if (a < 12000) return 'low';
+      if (a < 14000) return 'med';
+      if (a < 16000) return 'high';
+      return 'extreme';
     }
 
-    // Initial view: try lightning, else storms, else fallback
+    // Initial view: prefer lightning, fallback to storms
     var lats = [], lons = [];
     for (var i=0;i<points.length;i++){
       var p = points[i];
@@ -401,31 +393,39 @@ else:
       { attribution: '© OpenStreetMap contributors' }
     ).addTo(map);
 
-    // --- Lightning points (plain LayerGroup of circleMarkers) ---
-    var lightningGroup = L.layerGroup().addTo(map);
+    // --- Lightning clusters with L.marker + divIcon ---
+    var lightningCluster = L.markerClusterGroup({
+      disableClusteringAtZoom: 11,
+      maxClusterRadius: 60
+    });
 
-    function renderLightning(){
-      lightningGroup.clearLayers();
+    function makeDotIcon(tier){
+      return L.divIcon({
+        html: "<span class='mk " + tier + "'></span>",
+        className: "",  // no default 'leaflet-div-icon' box
+        iconSize: [10,10],
+        iconAnchor: [5,5]
+      });
+    }
+
+    function renderLightningCluster(){
+      lightningCluster.clearLayers();
       for (var i=0;i<points.length;i++){
         var p = points[i];
         var lat = Number(p.lat), lon = Number(p.lon), alt = Number(p.alt);
         if (isNaN(lat) || isNaN(lon)) continue;
-
-        var c = colorForAlt(alt);
+        var tier = tierForAlt(alt);
         var popup = "<b>Alt:</b> " + (isFinite(alt)? alt : "n/a") + " m<br>"
                   + "<b>Lat/Lon:</b> " + lat.toFixed(4) + ", " + lon.toFixed(4);
         if (timeField && (timeField in p)) popup += "<br><b>Time:</b> " + String(p[timeField]);
-
-        var m = L.circleMarker([lat, lon], {
-          radius: 5, color: c, fillColor: c, fillOpacity: 0.9, opacity: 1, weight: 1
-        }).bindPopup(popup);
-
-        lightningGroup.addLayer(m);
+        var m = L.marker([lat, lon], { icon: makeDotIcon(tier), title: "Lightning" }).bindPopup(popup);
+        lightningCluster.addLayer(m);
       }
     }
-    renderLightning();
+    renderLightningCluster();
+    lightningCluster.addTo(map);
 
-    // --- Storm paths layer ---
+    // --- Storm layer (paths + start/end markers) ---
     var stormsGroup = L.layerGroup();
     function safe(x){ return (x===null || x===undefined) ? "" : String(x); }
     function buildStormPopup(meta, isStart){
@@ -453,28 +453,25 @@ else:
         var bl = [Number(s.b_lat), Number(s.b_lon)], el = [Number(s.e_lat), Number(s.e_lon)];
         if (!isFinite(bl[0]) || !isFinite(bl[1]) || !isFinite(el[0]) || !isFinite(el[1])) continue;
 
-        var line = L.polyline([bl, el], { color:'#2e7d32', weight:4, opacity:0.9 }).addTo(stormsGroup);
-        var startM = L.circleMarker(bl, { radius: 6, color:'#2e7d32', fillColor:'#2e7d32', fillOpacity:0.9 })
-                        .bindPopup(buildStormPopup(s.meta, true));
-        var endM   = L.circleMarker(el, { radius: 6, color:'#b71c1c', fillColor:'#b71c1c', fillOpacity:0.9 })
-                        .bindPopup(buildStormPopup(s.meta, false));
-        stormsGroup.addLayer(startM); stormsGroup.addLayer(endM);
+        L.polyline([bl, el], { color:'#2e7d32', weight:4, opacity:0.9 }).addTo(stormsGroup);
+        L.circleMarker(bl, { radius: 6, color:'#2e7d32', fillColor:'#2e7d32', fillOpacity:0.9 })
+          .bindPopup(buildStormPopup(s.meta, true)).addTo(stormsGroup);
+        L.circleMarker(el, { radius: 6, color:'#b71c1c', fillColor:'#b71c1c', fillOpacity:0.9 })
+          .bindPopup(buildStormPopup(s.meta, false)).addTo(stormsGroup);
       }
     }
-    if (storms.length > 0) {
+    if (storms.length > 0){
       renderStorms();
       stormsGroup.addTo(map);
     }
 
     // Fit bounds to all data
     function fitData(){
-      var minLat=+90, maxLat=-90, minLon=+180, maxLon=-180, have=false;
-      // lightning
+      var have=false, minLat=+90, maxLat=-90, minLon=+180, maxLon=-180;
       for (var i=0;i<points.length;i++){
-        var p = points[i]; var lat = Number(p.lat), lon = Number(p.lon);
-        if (!isNaN(lat) && !isNaN(lon)){ have=true; if (lat<minLat)minLat=lat; if(lat>maxLat)maxLat=lat; if(lon<minLon)minLon=lon; if(lon>maxLon)maxLon=lon; }
+        var p = points[i]; var la = Number(p.lat), lo = Number(p.lon);
+        if (!isNaN(la) && !isNaN(lo)){ have=true; if (la<minLat)minLat=la; if(la>maxLat)maxLat=la; if(lo<minLon)minLon=lo; if(lo>maxLon)maxLon=lo; }
       }
-      // storms
       for (var i=0;i<storms.length;i++){
         var s = storms[i];
         var bl = [Number(s.b_lat), Number(s.b_lon)], el = [Number(s.e_lat), Number(s.e_lon)];
@@ -488,13 +485,13 @@ else:
     }
     fitData();
 
-    // Layer toggles
+    // Toggles
     var cbL = document.getElementById('toggleLightning');
     var cbS = document.getElementById('toggleStorms');
 
     function syncLightning(){
-      if (cbL.checked){ lightningGroup.addTo(map); }
-      else { map.removeLayer(lightningGroup); }
+      if (cbL.checked){ lightningCluster.addTo(map); }
+      else { map.removeLayer(lightningCluster); }
     }
     function syncStorms(){
       if (cbS.checked){ stormsGroup.addTo(map); }
@@ -519,7 +516,7 @@ else:
         .replace("__STORMCHECK__", "checked" if len(storm_rows) > 0 else "")
     )
 
-    st_html(html, height=760, scrolling=False)
+    st_html(html, height=780, scrolling=False)
 
 # =========================
 # Data Preview & Export
@@ -538,6 +535,5 @@ st.download_button("Download filtered lightning CSV",
                    mime="text/csv")
 
 st.caption(
-    "Legend shows altitude color coding for lightning and a green line for storm paths (begin→end). "
-    "Popups on storm start/end markers include EF scale, length, width, WFO, state, times, and narrative."
+    "Lightning markers are clustered (zoom in to expand). Storm reports overlay as green paths with start (green) and end (red) markers."
 )
